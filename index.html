@@ -608,15 +608,35 @@ async function ensureWorklet() {
   workletReady = true;
 }
 
-function setMicBanner(msg, isErr, showBtn) {
+function setMicBanner(msg, isErr, showBtn, label) {
   els.mic.hidden = false;
   els.micMsg.textContent = msg;
   els.mic.classList.toggle('err', !!isErr);
   els.micBtn.hidden = !showBtn;
+  let d = document.getElementById('micDiag');
+  if (!d) { d = document.createElement('div'); d.id = 'micDiag'; d.style.cssText = 'font:11px/1.4 monospace;opacity:.7;margin-top:6px;word-break:break-all;flex-basis:100%'; els.micMsg.parentNode.appendChild(d); }
+  d.textContent = 'Diagnose: ' + location.protocol + '//' + location.host + ' | sicher=' + window.isSecureContext + ' | Status=' + (micPerm ? micPerm.state : '?') + (micLastErr ? ' | Fehler=' + micLastErr : ' | Fehler=keiner');
+  if (label) els.micBtn.textContent = label;
 }
 
-async function ensureMic() {
-  if (S.micReady) return true;
+const MIC_MSG = {
+  prompt: 'Tippe auf Aktivieren. Dein Browser fragt dann, ob diese Seite das Mikrofon nutzen darf. Wähle „Zulassen“.',
+  granted: 'Das Mikrofon ist für diese Seite erlaubt. Tippe auf Aktivieren, um es zu starten.',
+  blocked: 'Dein Browser hat das Mikrofon für diese Seite gesperrt und kann deshalb nicht noch einmal fragen. Tippe in der Adressleiste auf das Schloss- oder Seiteninfo-Symbol und erlaube dort das Mikrofon. Die App merkt es dann von selbst.',
+  dismissed: 'Das Fenster wurde geschlossen, ohne zu antworten. Tippe noch einmal auf Aktivieren und wähle „Zulassen“.',
+  system: 'Android blockiert das Mikrofon für deinen Browser. Öffne die Android-Einstellungen, dann Apps, deinen Browser, Berechtigungen, Mikrofon, und erlaube es. Danach tippst du hier auf Erneut versuchen.',
+  missing: 'Es wurde kein Mikrofon gefunden.',
+  other: 'Das Mikrofon konnte nicht gestartet werden.'
+};
+
+let micPending = null, micLastErr = '';
+function ensureMic() {
+  if (S.micReady) return Promise.resolve(true);
+  if (!micPending) micPending = startMic().finally(() => { micPending = null; });
+  return micPending;
+}
+
+async function startMic() {
   if (!ctx) { setMicBanner('Dieser Browser unterstützt Web Audio nicht.', true, false); return false; }
   if (!window.isSecureContext) {
     setMicBanner('Das Mikrofon funktioniert nur auf einer https-Seite. Öffne die App über eine https-Adresse.', true, false);
@@ -627,11 +647,11 @@ async function ensureMic() {
     return false;
   }
   try {
-    const resumed = ctx.resume();
+    micLastErr = 'Anfrage läuft';
+    ctx.resume().catch(() => {});
     micStream = await navigator.mediaDevices.getUserMedia({
       audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false, channelCount: 1 }
     });
-    await resumed;
     await ensureWorklet();
     micSource = ctx.createMediaStreamSource(micStream);
     analyser = ctx.createAnalyser();
@@ -655,17 +675,47 @@ async function ensureMic() {
     syncSettingsUI();
     return true;
   } catch (err) {
-    const n = err && err.name;
-    if (n === 'NotAllowedError' || n === 'SecurityError') {
-      setMicBanner('Mikrofonzugriff ist blockiert. Erlaube ihn in den Browser-Einstellungen für diese Seite und tippe dann auf Aktivieren.', true, true);
-    } else if (n === 'NotFoundError' || n === 'OverconstrainedError') {
-      setMicBanner('Es wurde kein Mikrofon gefunden.', true, true);
-    } else {
-      setMicBanner('Das Mikrofon konnte nicht gestartet werden.', true, true);
-    }
+    if (micStream && !S.micReady) { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
+    showMicError(err);
     return false;
   }
 }
+
+function showMicError(err) {
+  micLastErr = ((err && err.name) || '?') + ': ' + ((err && err.message) || '');
+  const n = err && err.name, m = String((err && err.message) || '').toLowerCase();
+  if (n === 'NotAllowedError' || n === 'SecurityError') {
+    if (m.includes('dismissed')) setMicBanner(MIC_MSG.dismissed, true, true, 'Aktivieren');
+    else if (m.includes('system')) setMicBanner(MIC_MSG.system, true, true, 'Erneut versuchen');
+    else setMicBanner(MIC_MSG.blocked, true, true, 'Erneut versuchen');
+  } else if (n === 'NotFoundError' || n === 'OverconstrainedError') {
+    setMicBanner(MIC_MSG.missing, true, true, 'Erneut versuchen');
+  } else {
+    setMicBanner(MIC_MSG.other, true, true, 'Erneut versuchen');
+  }
+}
+
+/* Berechtigungsstatus beobachten: Hinweis passend zum Zustand, und automatisch weitermachen, sobald erlaubt */
+let micPerm = null;
+function applyMicPermState() {
+  if (S.micReady || !micPerm) return;
+  const st = micPerm.state;
+  if (st === 'denied') setMicBanner(MIC_MSG.blocked, true, true, 'Erneut prüfen');
+  else if (st === 'granted') setMicBanner(MIC_MSG.granted, false, true, 'Aktivieren');
+  else setMicBanner(MIC_MSG.prompt, false, true, 'Aktivieren');
+}
+async function watchMicPermission() {
+  try {
+    if (!navigator.permissions || !navigator.permissions.query) { setMicBanner(MIC_MSG.prompt, false, true, 'Aktivieren'); return; }
+    micPerm = await navigator.permissions.query({ name: 'microphone' });
+    micPerm.addEventListener('change', () => {
+      if (S.micReady) return;
+      if (micPerm.state === 'granted') ensureMic(); else applyMicPermState();
+    });
+    applyMicPermState();
+  } catch (_) { setMicBanner(MIC_MSG.prompt, false, true, 'Aktivieren'); }
+}
+document.addEventListener('visibilitychange', () => { if (!document.hidden) applyMicPermState(); });
 
 function estimateLatency() {
   let e = 0;
@@ -808,6 +858,69 @@ function writeProject() {
   if (!p) return;
   p.updated = Date.now(); p.nTracks = S.tracks.length; p.dur = maxEnd();
   dbPut('projects', p);
+}
+
+/* Absturzsicherung: laufende Aufnahme wird alle paar Sekunden in Stücken gesichert und beim Start wiederhergestellt */
+const REC_RANGE = id => IDBKeyRange.bound('rec:' + id + ':', 'rec:' + id + ':\uffff');
+function saveRecSegment(r) {
+  if (!r || r.saved >= r.chunks.length) return;
+  const part = r.chunks.slice(r.saved);
+  r.saved = r.chunks.length;
+  let n = 0;
+  for (const c of part) n += c.length;
+  const d = new Float32Array(n);
+  let o = 0;
+  for (const c of part) { d.set(c, o); o += c.length; }
+  dbPut('audio', { id: 'rec:' + r.id + ':' + String(r.seq++).padStart(5, '0'), data: d });
+}
+function startRecBackup(r) {
+  r.id = newId('r'); r.seq = 0; r.saved = 0;
+  dbPut('audio', { id: 'rec:' + r.id + ':m', trackId: r.track.id, sr: ctx.sampleRate, p0: S.p0, lat: Math.round(latencySec() * ctx.sampleRate) });
+  r.timer = setInterval(() => saveRecSegment(r), 2000);
+}
+function endRecBackup(r) {
+  if (!r || !r.id) return;
+  clearInterval(r.timer);
+  dbRun('audio', 'readwrite', os => os.delete(REC_RANGE(r.id))).catch(() => {});
+}
+async function recoverRecordings() {
+  let all = [];
+  try { all = await dbRun('audio', 'readonly', os => os.getAll(IDBKeyRange.bound('rec:', 'rec:\uffff'))); } catch (_) { return 0; }
+  const groups = {};
+  for (const a of all) {
+    const m = /^rec:([^:]+):(.+)$/.exec(a.id);
+    if (!m) continue;
+    const g = groups[m[1]] || (groups[m[1]] = { segs: [], meta: null });
+    if (m[2] === 'm') g.meta = a; else g.segs.push(a);
+  }
+  let n = 0;
+  for (const rid of Object.keys(groups)) {
+    const g = groups[rid];
+    try {
+      if (g.meta && g.segs.length) {
+        g.segs.sort((x, y) => (x.id < y.id ? -1 : 1));
+        let tot = 0;
+        for (const sg of g.segs) tot += sg.data.length;
+        const take = new Float32Array(tot);
+        let o = 0;
+        for (const sg of g.segs) { take.set(sg.data, o); o += sg.data.length; }
+        const tm = await dbGet('tracks', g.meta.trackId);
+        if (tm && tot > 0) {
+          const old = await dbGet('audio', g.meta.trackId), sr = g.meta.sr;
+          let od = old && old.data ? old.data : new Float32Array(0);
+          if (old && old.sr && old.sr !== sr) od = OD.resampleLinear(od, old.sr, sr);
+          let startIdx = Math.round(g.meta.p0 * sr) - g.meta.lat, src = take;
+          if (startIdx < 0) { src = take.subarray(-startIdx); startIdx = 0; }
+          const nd = new Float32Array(Math.max(od.length, startIdx + src.length));
+          nd.set(od); nd.set(src, startIdx);
+          await dbRun('audio', 'readwrite', os => os.put({ id: g.meta.trackId, sr, data: nd }));
+          n++;
+        }
+      }
+    } catch (_) { continue; }
+    try { await dbRun('audio', 'readwrite', os => os.delete(REC_RANGE(rid))); } catch (_) {}
+  }
+  return n;
 }
 
 function loadSettings() {
@@ -1095,6 +1208,7 @@ function startTransport(rec) {
   applyGains();
   if (rec) {
     S.rec = { track: target, startFrame: Math.round(T * sr), chunks: [], total: 0, peaks: [], acc: 0, accN: 0, done: false };
+    startRecBackup(S.rec);
     recNode.port.postMessage('on');
     S.mode = 'recording';
     target.emptyEl.hidden = true;
@@ -1230,7 +1344,7 @@ function finalizeRecording() {
   clearTimeout(S.flushTimer);
   if (recNode) recNode.port.postMessage('off');
   const t = r.track;
-  if (r.total === 0 || !byId(t.id)) { if (byId(t.id)) { refresh(t); drawTrack(t); } return; }
+  if (r.total === 0 || !byId(t.id)) { endRecBackup(r); if (byId(t.id)) { refresh(t); drawTrack(t); } return; }
   const sr = ctx.sampleRate;
   const take = new Float32Array(r.total);
   let o = 0;
@@ -1245,6 +1359,7 @@ function finalizeRecording() {
   t.prev = old; t.data = nd; t._nudged = false; t.shiftMs = 0;
   t.peaks = computePeaks(nd);
   saveAudio(t);
+  endRecBackup(r);
   recalcView();
   S.tracks.forEach(refresh);
   redrawAll();
@@ -1272,7 +1387,7 @@ async function onRec() {
   S.busy = true;
   try {
     const ok = await ensureMic();
-    if (!ok) return;
+    if (!ok) { toast('Das Mikrofon ist noch nicht freigegeben. Siehe Hinweis oben.'); return; }
     if (!armed()) { toast('Wähle zuerst eine Spur zum Aufnehmen.'); return; }
     await ctx.resume();
     startTransport(true);
@@ -1846,7 +1961,11 @@ if ('showDirectoryPicker' in window) {
 document.addEventListener('keydown', e => {
   if (e.key === 'Escape') { closeSheets(); els.expSheet.hidden = true; }
 });
-window.addEventListener('pagehide', () => { flushPending(); writeProject(); });
+window.addEventListener('pagehide', () => { saveRecSegment(S.rec); flushPending(); writeProject(); });
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) { saveRecSegment(S.rec); flushPending(); }
+  else if (S.mode !== 'stopped') lockScreen();
+});
 
 if ('ResizeObserver' in window) new ResizeObserver(measure).observe(els.scroll);
 window.addEventListener('resize', measure);
@@ -1880,11 +1999,15 @@ async function init() {
   loadSettings();
   if (!ctx) { setMicBanner('Dieser Browser unterstützt Web Audio nicht.', true, false); return; }
   if (!window.isSecureContext) setMicBanner('Das Mikrofon funktioniert nur auf einer https-Seite. Öffne die App über eine https-Adresse.', true, false);
+  else watchMicPermission();
+  let recovered = 0;
+  try { recovered = await recoverRecordings(); } catch (_) {}
   const list = await listProjects();
   let rec = list.find(p => p.id === S.settings.lastProject) || list[0];
   if (!rec) { rec = newProjectRecord('Mein Projekt'); await dbPut('projects', rec); }
   await openProject(rec);
   syncSettingsUI();
+  if (recovered) toast('Eine unterbrochene Aufnahme wurde wiederhergestellt.');
   requestAnimationFrame(tick);
 }
 init();
