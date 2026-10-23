@@ -74,7 +74,7 @@
   .lab{display:flex;justify-content:space-between;align-items:baseline;gap:6px;font-size:12px;font-weight:600;letter-spacing:.1em;text-transform:uppercase;color:var(--muted)}
   .lab output{font-family:var(--mono);font-size:12px;letter-spacing:0;color:var(--fg);font-variant-numeric:tabular-nums}
   .ctl input[type=range]{width:100%;height:30px;margin:0;accent-color:var(--c)}
-  .row2{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}
+  .row2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
   .nudge{display:grid;grid-template-columns:minmax(0,1.3fr) repeat(4,minmax(0,1fr));gap:6px;align-items:center;margin-bottom:8px}
   .nl{display:flex;flex-direction:column;font-size:12px;font-weight:600;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);line-height:1.25}
   .nl output{font-family:var(--mono);font-size:12px;letter-spacing:0;color:var(--fg);font-variant-numeric:tabular-nums}
@@ -184,6 +184,21 @@
       <label for="monLevel">Mithör-Pegel <output id="monOut"></output></label>
       <input id="monLevel" type="range" min="0" max="1.5" step="0.01">
       <p class="hint">Mithören nur mit Kopfhörern verwenden, sonst gibt es Rückkopplung.</p>
+    </div>
+    <div class="field">
+      <label for="nr">Rauschentfernung</label>
+      <select id="nr">
+        <option value="0">Aus</option>
+        <option value="1">Leicht</option>
+        <option value="2">Mittel</option>
+        <option value="3">Stark</option>
+      </select>
+      <label for="comp" style="margin-top:12px">Kompressor und Lautstärke</label>
+      <select id="comp">
+        <option value="1">An (lauter und gleichmäßiger)</option>
+        <option value="0">Aus</option>
+      </select>
+      <p class="hint">Wird nach jeder Aufnahme automatisch auf den neuen Take angewendet. Dazu kommt immer ein Filter gegen Tiefen-Rumpeln (unter 80 Hz). Das Mithören bleibt unbearbeitet. Mit „Verbessern“ an einer Spur bearbeitest du schon vorhandene Aufnahmen nachträglich.</p>
     </div>
     <button id="closeSheet" class="btn">Schließen</button>
   </div>
@@ -516,9 +531,148 @@ const OD = (() => {
       '})();';
   }
 
+  /* ---------- Sprachaufbereitung: Hochpass, Rauschentfernung, Kompressor, Lautstärke ---------- */
+  function makeFft(n) {
+    const bits = Math.round(Math.log2(n)), rev = new Uint32Array(n);
+    const cs = new Float64Array(n / 2), sn = new Float64Array(n / 2);
+    for (let i = 0; i < n; i++) { let r = 0; for (let b = 0; b < bits; b++) if (i & (1 << b)) r |= 1 << (bits - 1 - b); rev[i] = r; }
+    for (let i = 0; i < n / 2; i++) { cs[i] = Math.cos(2 * Math.PI * i / n); sn[i] = -Math.sin(2 * Math.PI * i / n); }
+    return function (re, im, inv) {
+      for (let i = 0; i < n; i++) {
+        const j = rev[i];
+        if (j > i) { let t = re[i]; re[i] = re[j]; re[j] = t; t = im[i]; im[i] = im[j]; im[j] = t; }
+      }
+      for (let size = 2; size <= n; size <<= 1) {
+        const half = size >> 1, step = n / size;
+        for (let i = 0; i < n; i += size) {
+          for (let j = 0, k = 0; j < half; j++, k += step) {
+            const wr = cs[k], wi = inv ? -sn[k] : sn[k], a = i + j, b = a + half;
+            const tr = re[b] * wr - im[b] * wi, ti = re[b] * wi + im[b] * wr;
+            re[b] = re[a] - tr; im[b] = im[a] - ti; re[a] += tr; im[a] += ti;
+          }
+        }
+      }
+      if (inv) for (let i = 0; i < n; i++) { re[i] /= n; im[i] /= n; }
+    };
+  }
+
+  function highpass(x, sr, fc) {
+    const w0 = 2 * Math.PI * fc / sr, c = Math.cos(w0), al = Math.sin(w0) / (2 * 0.7071);
+    const a0 = 1 + al, b0 = (1 + c) / 2 / a0, b1 = -(1 + c) / a0, b2 = b0;
+    const a1 = -2 * c / a0, a2 = (1 - al) / a0;
+    const y = new Float32Array(x.length);
+    let x1 = 0, x2 = 0, y1 = 0, y2 = 0;
+    for (let i = 0; i < x.length; i++) {
+      const v = x[i], o = b0 * v + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2;
+      x2 = x1; x1 = v; y2 = y1; y1 = o; y[i] = o;
+    }
+    return y;
+  }
+
+  const NR_PRESETS = [null, { alpha: 1.6, floor: 0.45 }, { alpha: 2.2, floor: 0.25 }, { alpha: 3.0, floor: 0.12 }];
+
+  /* Spektrale Rauschminderung; das Rauschprofil kommt aus den leisesten Stellen der Aufnahme selbst */
+  async function denoise(x, sr, level, yieldFn) {
+    const P = NR_PRESETS[level];
+    const N = 1024, H = 512, K = N / 2 + 1, len = x.length;
+    if (!P || len < N * 24) return x;
+    const win = new Float64Array(N);
+    for (let i = 0; i < N; i++) win[i] = Math.sin(Math.PI * (i + 0.5) / N);
+    const L2 = H + len + N, F = Math.floor((L2 - N) / H) + 1;
+    const at = i => { const j = i - H; return j >= 0 && j < len ? x[j] : 0; };
+    const en = new Float64Array(F);
+    for (let f = 0; f < F; f++) {
+      let s = 0; const o = f * H - H;
+      for (let i = 0; i < N; i += 2) { const j = o + i; if (j >= 0 && j < len) s += x[j] * x[j]; }
+      en[f] = s;
+    }
+    const order = Array.from(en.keys()).sort((a, b) => en[a] - en[b]);
+    const nq = Math.max(8, Math.min(400, Math.floor(F * 0.15)));
+    const fft = makeFft(N), re = new Float64Array(N), im = new Float64Array(N);
+    const noise = new Float64Array(K);
+    for (let q = 0; q < nq; q++) {
+      const f = order[q];
+      for (let i = 0; i < N; i++) { re[i] = at(f * H + i) * win[i]; im[i] = 0; }
+      fft(re, im, false);
+      for (let k = 0; k < K; k++) noise[k] += re[k] * re[k] + im[k] * im[k];
+    }
+    for (let k = 0; k < K; k++) noise[k] /= nq;
+    const nsm = new Float64Array(K);
+    for (let k = 0; k < K; k++) {
+      const a = noise[Math.max(0, k - 1)], b = noise[k], c = noise[Math.min(K - 1, k + 1)];
+      nsm[k] = (a + 2 * b + c) / 4;
+    }
+    const out = new Float64Array(L2), g = new Float64Array(K), gp = new Float64Array(K).fill(1), gs = new Float64Array(K);
+    const fl2 = P.floor * P.floor;
+    for (let f = 0; f < F; f++) {
+      const o = f * H;
+      for (let i = 0; i < N; i++) { re[i] = at(o + i) * win[i]; im[i] = 0; }
+      fft(re, im, false);
+      for (let k = 0; k < K; k++) {
+        const p = re[k] * re[k] + im[k] * im[k] + 1e-20;
+        let v = 1 - P.alpha * nsm[k] / p;
+        if (v < fl2) v = fl2;
+        let gg = Math.sqrt(v);
+        gg = gg > gp[k] ? gp[k] + 0.7 * (gg - gp[k]) : gp[k] + 0.3 * (gg - gp[k]);
+        gp[k] = gg; g[k] = gg;
+      }
+      for (let k = 0; k < K; k++) gs[k] = (g[Math.max(0, k - 1)] + 2 * g[k] + g[Math.min(K - 1, k + 1)]) / 4;
+      for (let k = 0; k < K; k++) {
+        re[k] *= gs[k]; im[k] *= gs[k];
+        if (k > 0 && k < N / 2) { re[N - k] = re[k]; im[N - k] = -im[k]; }
+      }
+      im[0] = 0; im[N / 2] = 0;
+      fft(re, im, true);
+      for (let i = 0; i < N; i++) out[o + i] += re[i] * win[i];
+      if (yieldFn && (f & 63) === 63) await yieldFn(f / F);
+    }
+    const y = new Float32Array(len);
+    for (let i = 0; i < len; i++) y[i] = out[i + H];
+    return y;
+  }
+
+  /* Kompressor, danach auf einheitliche Lautstärke bringen und weich begrenzen */
+  function compressNormalize(x, sr) {
+    const len = x.length, y = new Float32Array(len);
+    const aA = Math.exp(-1 / (0.005 * sr)), aR = Math.exp(-1 / (0.15 * sr));
+    const thr = -26, slope = 1 - 1 / 3;
+    let env = 0;
+    for (let i = 0; i < len; i++) {
+      const v = x[i], a = v < 0 ? -v : v;
+      env = a > env ? aA * env + (1 - aA) * a : aR * env + (1 - aR) * a;
+      let gdb = 0;
+      if (env > 1e-5) { const over = 20 * Math.log10(env) - thr; if (over > 0) gdb = -over * slope; }
+      y[i] = v * (gdb === 0 ? 1 : Math.pow(10, gdb / 20));
+    }
+    const BINS = 4096, hist = new Uint32Array(BINS);
+    let cnt = 0;
+    for (let i = 0; i < len; i += 4) {
+      const a = Math.abs(y[i]);
+      hist[Math.min(BINS - 1, Math.floor(a * BINS))]++; cnt++;
+    }
+    let acc = 0, p = 0;
+    for (let b = BINS - 1; b >= 0; b--) { acc += hist[b]; if (acc > cnt * 0.005) { p = (b + 1) / BINS; break; } }
+    if (p < 1e-4) return y;
+    const gain = Math.max(0.25, Math.min(31.6, 0.45 / p));
+    for (let i = 0; i < len; i++) {
+      const v = y[i] * gain, a = v < 0 ? -v : v;
+      y[i] = a < 0.8 ? v : (v < 0 ? -1 : 1) * (0.8 + 0.19 * Math.tanh((a - 0.8) / 0.19));
+    }
+    return y;
+  }
+
+  async function voiceFx(x, sr, opt, yieldFn) {
+    const nr = opt && opt.nr | 0, comp = !!(opt && opt.comp);
+    if (!nr && !comp) return x;
+    let y = highpass(x, sr, 80);
+    if (nr) y = await denoise(y, sr, nr, yieldFn);
+    if (comp) y = compressNormalize(y, sr);
+    return y;
+  }
+
   return { clamp, FADER_MIN, FADER_MAX, UNITY_P, faderToGain, gainToFader, dbText, panText, panGains,
     mixStereo, toInt16, resampleLinear, encodeWav16, decodeWav, crc32, zipStore, unzip, safeName, fmtSize, mp3WorkerSource,
-    chirpTemplate, findTemplate, median };
+    chirpTemplate, findTemplate, median, voiceFx, highpass, denoise, compressNormalize };
 })();
 </script>
 
@@ -541,7 +695,7 @@ const els = {
   toast: $('toast'), addTrack: $('addTrack'),
   rew: $('btnRew'), stop: $('btnStop'), play: $('btnPlay'), rec: $('btnRec'),
   sheet: $('sheet'), lat: $('lat'), latOut: $('latOut'), latAuto: $('latAuto'), calBtn: $('calBtn'), calMsg: $('calMsg'), countIn: $('countIn'),
-  monLevel: $('monLevel'), monOut: $('monOut'), closeSheet: $('closeSheet'),
+  monLevel: $('monLevel'), nr: $('nr'), comp: $('comp'), monOut: $('monOut'), closeSheet: $('closeSheet'),
   projSheet: $('projSheet'), projName: $('projName'), projSave: $('projSave'), projSaveDir: $('projSaveDir'),
   projLoad: $('projLoad'), projLoadDir: $('projLoadDir'), projFile: $('projFile'), kbps: $('kbps'),
   projMp3: $('projMp3'), projWav: $('projWav'), projList: $('projList'), projNew: $('projNew'), closeProj: $('closeProj'),
@@ -553,7 +707,7 @@ const S = {
   project: null, tracks: [], armedId: null, mode: 'stopped', playhead: 0, p0: 0, T: 0,
   sources: [], beeps: [], rec: null, cal: null, flushTimer: 0, viewDur: 20, waveW: 0,
   monitor: false, busy: false, micReady: false,
-  settings: { latency: null, countIn: 3, monLevel: 1, kbps: 192, lastProject: null }
+  settings: { latency: null, countIn: 3, monLevel: 1, kbps: 192, lastProject: null, nr: 2, comp: true }
 };
 
 /* ---------- Audio-Grundlagen ---------- */
@@ -965,6 +1119,7 @@ function buildTrackEl(t) {
     '</div>' +
     '<div class="row2">' +
       '<button class="mini undo">Take zurück</button>' +
+      '<button class="mini fx">Verbessern</button>' +
       '<button class="mini exp">WAV</button>' +
       '<button class="mini del">Löschen</button>' +
     '</div>';
@@ -1059,7 +1214,7 @@ function applyGains() {
 
 /* Take nachträglich früher (minus) oder später (plus) setzen */
 function shiftTrack(t, ms) {
-  if (S.mode !== 'stopped' || S.rec || !t.data.length) return;
+  if (S.mode !== 'stopped' || S.fxBusy || S.rec || !t.data.length) return;
   const n = Math.round(ms / 1000 * ctx.sampleRate);
   if (!n) return;
   const old = t.data;
@@ -1349,9 +1504,22 @@ function finalizeRecording() {
   const take = new Float32Array(r.total);
   let o = 0;
   for (const c of r.chunks) { take.set(c, o); o += c.length; }
-  const lat = Math.round(latencySec() * sr);
-  let startIdx = Math.round(S.p0 * sr) - lat, src = take;
-  if (startIdx < 0) { src = take.subarray(-startIdx); startIdx = 0; }
+  const lat = Math.round(latencySec() * sr), p0 = S.p0;
+  const fx = { nr: Number(S.settings.nr) || 0, comp: !!S.settings.comp };
+  placeTake(r, t, take, p0, lat, fx);
+}
+async function placeTake(r, t, take, p0, lat, fx) {
+  const sr = ctx.sampleRate;
+  let proc = take;
+  if (fx.nr || fx.comp) {
+    S.fxBusy = true; S.fxPct = 0;
+    try { proc = await OD.voiceFx(take, sr, fx, yieldUi); }
+    catch (_) { proc = take; }
+    finally { S.fxBusy = false; }
+  }
+  if (!byId(t.id)) { endRecBackup(r); return; }
+  let startIdx = Math.round(p0 * sr) - lat, src = proc;
+  if (startIdx < 0) { src = proc.subarray(-startIdx); startIdx = 0; }
   const old = t.data;
   const nd = new Float32Array(Math.max(old.length, startIdx + src.length));
   nd.set(old);
@@ -1363,7 +1531,26 @@ function finalizeRecording() {
   recalcView();
   S.tracks.forEach(refresh);
   redrawAll();
-  toast('Take gespeichert in „' + t.name + '“');
+  toast('Take gespeichert in „' + t.name + '“' + (fx.nr || fx.comp ? ' (aufbereitet)' : ''));
+}
+function yieldUi(pct) { S.fxPct = pct || 0; return new Promise(res => setTimeout(res, 0)); }
+
+/* Vorhandene Spur nachträglich aufbereiten */
+async function enhanceTrack(t) {
+  if (S.busy || S.fxBusy || S.rec || S.mode !== 'stopped' || !t.data.length) return;
+  const fx = { nr: Number(S.settings.nr) || 0, comp: !!S.settings.comp };
+  if (!fx.nr && !fx.comp) { toast('In den Einstellungen sind Rauschentfernung und Kompressor aus.'); return; }
+  S.fxBusy = true; S.fxPct = 0;
+  const old = t.data;
+  try {
+    const proc = await OD.voiceFx(old, ctx.sampleRate, fx, yieldUi);
+    if (!byId(t.id) || t.data !== old) return;
+    t.prev = old; t.data = proc; t._nudged = false; t.shiftMs = 0;
+    t.peaks = computePeaks(proc);
+    saveAudio(t); refresh(t); recalcView(); drawTrack(t);
+    toast('Spur „' + t.name + '“ verbessert. „Take zurück“ macht es rückgängig.');
+  } catch (_) { toast('Das Verbessern hat nicht geklappt.'); }
+  finally { S.fxBusy = false; S.tracks.forEach(refresh); }
 }
 
 function syncTransport() {
@@ -1372,7 +1559,7 @@ function syncTransport() {
 }
 
 async function onPlay() {
-  if (S.busy || S.rec || S.mode !== 'stopped' || !ctx) return;
+  if (S.busy || S.fxBusy || S.rec || S.mode !== 'stopped' || !ctx) return;
   S.busy = true;
   try {
     await ctx.resume();
@@ -1381,7 +1568,7 @@ async function onPlay() {
   } finally { S.busy = false; }
 }
 async function onRec() {
-  if (S.busy || !ctx) return;
+  if (S.busy || S.fxBusy || !ctx) return;
   if (S.mode === 'recording') { stopTransport(); return; }
   if (S.mode !== 'stopped' || S.rec) return;
   S.busy = true;
@@ -1547,6 +1734,7 @@ async function listProjects() {
 }
 
 async function openProject(rec) {
+  while (S.fxBusy) await new Promise(r => setTimeout(r, 100));
   S.busy = true;
   try { await openProjectInner(rec); } finally { S.busy = false; }
 }
@@ -1797,6 +1985,8 @@ function syncSettingsUI() {
   els.monLevel.value = S.settings.monLevel;
   els.monOut.textContent = Math.round(S.settings.monLevel * 100) + ' %';
   els.kbps.value = String(S.settings.kbps);
+  els.nr.value = String(S.settings.nr);
+  els.comp.value = S.settings.comp ? '1' : '0';
 }
 function applyMonitor() {
   els.monBtn.setAttribute('aria-pressed', String(S.monitor));
@@ -1823,6 +2013,8 @@ els.tracks.addEventListener('click', e => {
     t.data = t.prev; t.prev = null; t._nudged = false; t.shiftMs = 0; t.peaks = computePeaks(t.data);
     saveAudio(t); refresh(t); recalcView(); drawTrack(t);
     toast('Letzter Take zurückgenommen');
+  } else if (b.classList.contains('fx')) {
+    if (!busyRec) enhanceTrack(t);
   } else if (b.classList.contains('nb')) {
     if (busyRec) return;
     shiftTrack(t, Number(b.dataset.ms));
@@ -1918,6 +2110,8 @@ els.sheet.addEventListener('click', e => { if (e.target === els.sheet) els.sheet
 els.lat.addEventListener('input', () => { S.settings.latency = Number(els.lat.value); saveSettings(); syncSettingsUI(); });
 els.calBtn.addEventListener('click', calibrateLatency);
 els.latAuto.addEventListener('click', () => { S.settings.latency = null; saveSettings(); syncSettingsUI(); });
+els.nr.addEventListener('change', () => { S.settings.nr = Number(els.nr.value); saveSettings(); });
+els.comp.addEventListener('change', () => { S.settings.comp = els.comp.value === '1'; saveSettings(); });
 els.countIn.addEventListener('change', () => { S.settings.countIn = Number(els.countIn.value); saveSettings(); });
 els.monLevel.addEventListener('input', () => {
   S.settings.monLevel = Number(els.monLevel.value); saveSettings(); syncSettingsUI(); applyMonitor();
@@ -1989,7 +2183,7 @@ function tick(now) {
     setStatus('Wiedergabe', 'play');
     if (pos >= maxEnd() + 0.15) stopTransport();
   } else {
-    setStatus(S.rec ? 'Speichere…' : 'Bereit', '');
+    setStatus(S.fxBusy ? 'Verarbeite ' + Math.round((S.fxPct || 0) * 100) + ' %' : S.rec ? 'Speichere…' : 'Bereit', '');
   }
   drawMeter(now);
 }
