@@ -1,0 +1,65 @@
+name: APK bauen
+on:
+  push:
+    paths-ignore:
+      - '.apk-signing/**'
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: apk-build
+  cancel-in-progress: true
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+      - name: Projektdaten lesen
+        run: |
+          echo "APP_NAME=$(jq -r .name apk.json)" >> "$GITHUB_ENV"
+          echo "APP_ID=$(jq -r .appId apk.json)" >> "$GITHUB_ENV"
+      - name: Signaturschluessel bereitstellen
+        run: |
+          mkdir -p ~/.android
+          if [ ! -f .apk-signing/debug.keystore ]; then
+            mkdir -p .apk-signing
+            keytool -genkeypair -keystore .apk-signing/debug.keystore -storepass android -keypass android -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
+            git config user.name "apk-bot"
+            git config user.email "apk-bot@users.noreply.github.com"
+            git add .apk-signing/debug.keystore
+            git commit -m "Signaturschluessel fuer die App"
+            git pull --rebase
+            git push
+          fi
+          cp .apk-signing/debug.keystore ~/.android/debug.keystore
+      - name: Capacitor-Projekt erzeugen
+        run: |
+          mkdir -p _build/www
+          rsync -a --exclude='.git' --exclude='.github' --exclude='.apk-signing' --exclude='_build' --exclude='apk.json' --exclude='README.md' ./ _build/www/
+          cd _build
+          npm init -y > /dev/null
+          npm install @capacitor/core@7 @capacitor/cli@7 @capacitor/android@7
+          npx cap init "$APP_NAME" "$APP_ID" --web-dir www
+          npx cap add android
+          sed -i 's#</manifest>#    <uses-permission android:name="android.permission.RECORD_AUDIO" />\n    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />\n</manifest>#' android/app/src/main/AndroidManifest.xml
+          sed -i "s/versionCode 1/versionCode $GITHUB_RUN_NUMBER/" android/app/build.gradle
+          npx cap sync android
+      - name: APK bauen
+        working-directory: _build/android
+        run: ./gradlew assembleDebug --no-daemon
+      - name: APK veroeffentlichen
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          NAME="${GITHUB_REPOSITORY#*/}"
+          cp _build/android/app/build/outputs/apk/debug/app-debug.apk "$NAME.apk"
+          gh release view apk-latest --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1 || gh release create apk-latest --repo "$GITHUB_REPOSITORY" --title "Android-App (APK)" --notes "Neueste Version der App als APK."
+          gh release upload apk-latest "$NAME.apk" --repo "$GITHUB_REPOSITORY" --clobber
