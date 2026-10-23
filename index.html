@@ -190,6 +190,11 @@
       <p class="hint">Mithören nur mit Kopfhörern verwenden, sonst gibt es Rückkopplung.</p>
     </div>
     <div class="field">
+      <label for="micDev">Mikrofon</label>
+      <select id="micDev"><option value="">Standard</option></select>
+      <p class="hint">Bei Bluetooth-Kopfhörern schaltet Android sonst auf das Headset-Mikrofon um, und dann klingt alles schlecht oder bleibt stumm. Wähle hier das Mikrofon des Handys (oft „Telefon“, „Eingebaut“ oder „Speakerphone“). Das Mikrofon wird nach etwa 20 Sekunden Pause und beim Verlassen der App automatisch freigegeben.</p>
+    </div>
+    <div class="field">
       <label for="nr">Rauschentfernung</label>
       <select id="nr">
         <option value="0">Aus</option>
@@ -756,7 +761,7 @@ const els = {
   toast: $('toast'), addTrack: $('addTrack'),
   rew: $('btnRew'), stop: $('btnStop'), play: $('btnPlay'), rec: $('btnRec'),
   sheet: $('sheet'), lat: $('lat'), latOut: $('latOut'), latAuto: $('latAuto'), calBtn: $('calBtn'), calMsg: $('calMsg'), countIn: $('countIn'),
-  monLevel: $('monLevel'), nr: $('nr'), comp: $('comp'), monOut: $('monOut'), closeSheet: $('closeSheet'),
+  monLevel: $('monLevel'), nr: $('nr'), comp: $('comp'), micDev: $('micDev'), monOut: $('monOut'), closeSheet: $('closeSheet'),
   projSheet: $('projSheet'), projName: $('projName'), projSave: $('projSave'), projSaveDir: $('projSaveDir'),
   projLoad: $('projLoad'), projLoadDir: $('projLoadDir'), projFile: $('projFile'), kbps: $('kbps'),
   projMp3: $('projMp3'), projWav: $('projWav'), projList: $('projList'), projNew: $('projNew'), closeProj: $('closeProj'),
@@ -766,9 +771,9 @@ const els = {
 
 const S = {
   project: null, tracks: [], armedId: null, mode: 'stopped', playhead: 0, p0: 0, T: 0,
-  sources: [], beeps: [], rec: null, cal: null, flushTimer: 0, viewDur: 20, waveW: 0,
+  micUse: 0, micIdleMs: 20000, relMicAfter: false, sources: [], beeps: [], rec: null, cal: null, flushTimer: 0, viewDur: 20, waveW: 0,
   monitor: false, busy: false, micReady: false,
-  settings: { latency: null, countIn: 3, monLevel: 1, kbps: 192, lastProject: null, nr: 2, comp: true }
+  settings: { latency: null, countIn: 3, monLevel: 1, kbps: 192, lastProject: null, nr: 2, comp: true, micDev: '' }
 };
 
 /* ---------- Audio-Grundlagen ---------- */
@@ -846,6 +851,7 @@ const MIC_MSG = {
 
 let micPending = null, micLastErr = '';
 function ensureMic() {
+  S.micUse = performance.now();
   if (S.micReady) return Promise.resolve(true);
   if (!micPending) micPending = startMic().finally(() => { micPending = null; });
   return micPending;
@@ -864,9 +870,16 @@ async function startMic() {
   try {
     micLastErr = 'Anfrage läuft';
     ctx.resume().catch(() => {});
-    micStream = await navigator.mediaDevices.getUserMedia({
-      audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false, channelCount: 1 }
-    });
+    micAutoReleased = false;
+    const audioC = { echoCancellation: false, noiseSuppression: false, autoGainControl: false, channelCount: 1 };
+    if (S.settings.micDev) audioC.deviceId = { exact: S.settings.micDev };
+    try { micStream = await navigator.mediaDevices.getUserMedia({ audio: audioC }); }
+    catch (e) {
+      if (S.settings.micDev && e && (e.name === 'OverconstrainedError' || e.name === 'NotFoundError')) {
+        S.settings.micDev = ''; saveSettings(); delete audioC.deviceId;
+        micStream = await navigator.mediaDevices.getUserMedia({ audio: audioC });
+      } else throw e;
+    }
     await ensureWorklet();
     micSource = ctx.createMediaStreamSource(micStream);
     analyser = ctx.createAnalyser();
@@ -886,8 +899,10 @@ async function startMic() {
     micSource.connect(monitorGain);
     monitorGain.connect(ctx.destination);
     S.micReady = true;
+    S.micUse = performance.now();
     els.mic.hidden = true;
     syncSettingsUI();
+    refreshMicList();
     return true;
   } catch (err) {
     if (micStream && !S.micReady) { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
@@ -896,6 +911,45 @@ async function startMic() {
   }
 }
 
+/* Mikrofon wieder freigeben (wichtig bei Bluetooth: sonst bleibt das Headset-Profil aktiv und anderer Ton ist stumm) */
+let micAutoReleased = false;
+function releaseMic() {
+  if (!S.micReady && !micStream) return;
+  for (const n of [micSource, recNode, monitorGain, silent, analyser]) { try { n && n.disconnect(); } catch (_) {} }
+  if (recNode) { try { recNode.port.onmessage = null; recNode.port.close(); } catch (_) {} }
+  if (micStream) { try { micStream.getTracks().forEach(t => t.stop()); } catch (_) {} }
+  micStream = micSource = recNode = monitorGain = silent = analyser = null;
+  S.micReady = false; S.monitor = false;
+  micAutoReleased = true;
+  applyMonitor();
+}
+function micBusy() { return S.mode !== 'stopped' || !!S.rec || !!S.cal || S.busy || S.fxBusy; }
+function micIdle() { return !micBusy() && !S.monitor; }
+setInterval(() => {
+  if (!S.micReady || micBusy()) return;
+  if (document.hidden || (!S.monitor && performance.now() - S.micUse > S.micIdleMs)) releaseMic();
+}, 1000);
+function leaveApp() {
+  if (S.mode === 'recording' && S.rec) { S.relMicAfter = true; stopTransport(); return; }
+  if (!micBusy()) releaseMic();
+  else if (S.mode === 'playing') stopTransport();
+}
+
+async function refreshMicList() {
+  if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) return;
+  let list = [];
+  try { list = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === 'audioinput' && d.deviceId); } catch (_) { return; }
+  const sel = els.micDev;
+  sel.innerHTML = '';
+  const o0 = document.createElement('option'); o0.value = ''; o0.textContent = 'Standard (vom Browser gewählt)'; sel.appendChild(o0);
+  list.forEach((d, i) => {
+    const o = document.createElement('option');
+    o.value = d.deviceId; o.textContent = d.label || ('Mikrofon ' + (i + 1));
+    sel.appendChild(o);
+  });
+  sel.value = S.settings.micDev || '';
+  if (sel.value !== (S.settings.micDev || '')) sel.value = '';
+}
 function showMicError(err) {
   micLastErr = ((err && err.name) || '?') + ': ' + ((err && err.message) || '');
   const n = err && err.name, m = String((err && err.message) || '').toLowerCase();
@@ -913,7 +967,7 @@ function showMicError(err) {
 /* Berechtigungsstatus beobachten: Hinweis passend zum Zustand, und automatisch weitermachen, sobald erlaubt */
 let micPerm = null;
 function applyMicPermState() {
-  if (S.micReady || !micPerm) return;
+  if (S.micReady || !micPerm || micAutoReleased) return;
   const st = micPerm.state;
   if (st === 'denied') setMicBanner(MIC_MSG.blocked, true, true, 'Erneut prüfen');
   else if (st === 'granted') setMicBanner(MIC_MSG.granted, false, true, 'Aktivieren');
@@ -930,7 +984,10 @@ async function watchMicPermission() {
     applyMicPermState();
   } catch (_) { setMicBanner(MIC_MSG.prompt, false, true, 'Aktivieren'); }
 }
-document.addEventListener('visibilitychange', () => { if (!document.hidden) applyMicPermState(); });
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) leaveApp(); else applyMicPermState();
+});
+if (navigator.mediaDevices && navigator.mediaDevices.addEventListener) navigator.mediaDevices.addEventListener('devicechange', () => { refreshMicList(); });
 
 function estimateLatency() {
   let e = 0;
@@ -1439,6 +1496,7 @@ async function lockScreen() { try { wakeLock = await navigator.wakeLock.request(
 function unlockScreen() { try { wakeLock && wakeLock.release(); } catch (_) {} wakeLock = null; }
 
 function startTransport(rec) {
+  S.micUse = performance.now();
   const sr = ctx.sampleRate;
   const countIn = rec ? Number(S.settings.countIn) || 0 : 0;
   const now = ctx.currentTime + 0.06;
@@ -1600,12 +1658,14 @@ function finalizeRecording() {
   S.rec = null;
   clearTimeout(S.flushTimer);
   if (recNode) recNode.port.postMessage('off');
+  if (S.relMicAfter) { S.relMicAfter = false; releaseMic(); }
   const t = r.track;
   if (r.total === 0 || !byId(t.id)) { endRecBackup(r); if (byId(t.id)) { refresh(t); drawTrack(t); } return; }
   const sr = ctx.sampleRate;
   const take = new Float32Array(r.total);
   let o = 0;
   for (const c of r.chunks) { take.set(c, o); o += c.length; }
+  S.micUse = performance.now();
   const lat = Math.round(latencySec() * sr), p0 = S.p0;
   const fx = { nr: Number(S.settings.nr) || 0, comp: !!S.settings.comp };
   placeTake(r, t, take, p0, lat, fx);
@@ -2238,7 +2298,12 @@ els.limBtn.addEventListener('click', () => {
 });
 
 /* Einstellungen */
-els.setBtn.addEventListener('click', () => { syncSettingsUI(); els.sheet.hidden = false; });
+els.setBtn.addEventListener('click', () => { syncSettingsUI(); refreshMicList(); els.sheet.hidden = false; });
+els.micDev.addEventListener('change', () => {
+  S.settings.micDev = els.micDev.value; saveSettings();
+  if (S.micReady && micIdle()) releaseMic();
+  toast('Mikrofon gewählt. Es wird beim nächsten Aufnehmen verwendet.');
+});
 els.closeSheet.addEventListener('click', () => { els.sheet.hidden = true; });
 els.sheet.addEventListener('click', e => { if (e.target === els.sheet) els.sheet.hidden = true; });
 els.lat.addEventListener('input', () => { S.settings.latency = Number(els.lat.value); saveSettings(); syncSettingsUI(); });
@@ -2289,7 +2354,7 @@ if ('showDirectoryPicker' in window) {
 document.addEventListener('keydown', e => {
   if (e.key === 'Escape') { closeSheets(); els.expSheet.hidden = true; }
 });
-window.addEventListener('pagehide', () => { saveRecSegment(S.rec); flushPending(); writeProject(); });
+window.addEventListener('pagehide', () => { saveRecSegment(S.rec); flushPending(); writeProject(); releaseMic(); });
 document.addEventListener('visibilitychange', () => {
   if (document.hidden) { saveRecSegment(S.rec); flushPending(); }
   else if (S.mode !== 'stopped') lockScreen();
