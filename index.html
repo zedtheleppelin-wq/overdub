@@ -34,6 +34,9 @@
   .proj svg{flex:none;width:14px;height:14px}
   .meter{flex:1 1 40px;min-width:40px;height:10px;background:var(--surface2);border-radius:5px;overflow:hidden}
   .meter canvas{display:block;width:100%;height:100%}
+  .proj{flex:0 1 auto;min-width:0}
+  .chip{flex:none}
+  @media (max-width:420px){.top{gap:6px;padding-left:10px;padding-right:10px}.chip{padding:0 8px;font-size:13px}.proj{max-width:30%;padding:0 8px;font-size:14px}.meter{flex-basis:20px;min-width:20px}}
   .chip{height:36px;padding:0 11px;border-radius:18px;border:1px solid var(--line);background:var(--surface2);font-weight:600;font-size:14px;white-space:nowrap}
   .chip[aria-pressed="true"]{background:var(--play);border-color:var(--play);color:#0c1a13}
   .icon{width:36px;height:36px;border-radius:18px;border:1px solid var(--line);background:var(--surface2);display:grid;place-items:center;padding:0;flex:none}
@@ -130,6 +133,7 @@
     </button>
     <div class="meter" aria-hidden="true"><canvas id="meter"></canvas></div>
     <button id="monBtn" class="chip" aria-pressed="false" aria-label="Eigenes Signal mithören">Mithören</button>
+    <button id="limBtn" class="chip" aria-pressed="false" aria-label="Limiter für den Mix">Limiter</button>
     <button id="setBtn" class="icon" aria-label="Einstellungen">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 7h9M19 7h1M4 17h1M11 17h9"/><circle cx="16" cy="7" r="2.4"/><circle cx="8" cy="17" r="2.4"/></svg>
     </button>
@@ -670,9 +674,66 @@ const OD = (() => {
     return y;
   }
 
+  /* ---------- Limiter für den ganzen Mix ----------
+     Analysiert den fertigen Mix im Voraus und legt eine Lautstärke-Automation darüber:
+     Die Absenkung beginnt schon vor der Spitze (Lookahead), ist weich und die Rückkehr passt sich an,
+     kurze Spitzen werden schnell freigegeben, anhaltend laute Stellen langsam.
+     Garantie: Kein Abtastwert liegt nach dem Limiter über der Obergrenze. */
+  const LIM_CEIL = Math.pow(10, -1 / 20);
+  function limitMix(L, R, sr, ceil, opt) {
+    const n = L.length, W = Math.max(8, Math.round(0.008 * sr)), D = 32;
+    const apply = !opt || opt.apply !== false;
+    ceil = ceil || LIM_CEIL;
+    const nb = Math.ceil(n / D) + 1, blockMin = new Float32Array(nb).fill(1);
+    const rr = k => {
+      if (k < 0 || k >= n) return 1;
+      const a = L[k] < 0 ? -L[k] : L[k], b = R[k] < 0 ? -R[k] : R[k], m = a > b ? a : b;
+      return m > ceil ? ceil / m : 1;
+    };
+    const cap = W + 2, di = new Int32Array(cap), dv = new Float32Array(cap);
+    let head = 0, tail = 0;
+    const push = k => {
+      const v = rr(k);
+      while (tail !== head) {
+        const p = tail === 0 ? cap - 1 : tail - 1;
+        if (dv[p] >= v) tail = p; else break;
+      }
+      di[tail] = k; dv[tail] = v; tail = tail + 1 === cap ? 0 : tail + 1;
+    };
+    for (let k = -(W - 1); k <= 0; k++) push(k);
+    const mb = new Float32Array(W);
+    let sum = 0, pos = 0, prev = 1, avgRed = 0, relK = Math.exp(-1 / (0.1 * sr)), minG = 1, nLim = 0;
+    const aAvg = 1 - Math.exp(-1 / (0.3 * sr));
+    for (let j = -(W - 1); j < n; j++) {
+      while (di[head] < j) head = head + 1 === cap ? 0 : head + 1;
+      const m = dv[head];
+      sum += m - mb[pos]; mb[pos] = m; pos = pos + 1 === W ? 0 : pos + 1;
+      if (j >= 0) {
+        const gs = sum / W;
+        const rec = prev + (1 - prev) * (1 - relK);
+        const gf = gs < rec ? gs : rec;
+        prev = gf;
+        avgRed += ((1 - gf) - avgRed) * aAvg;
+        if ((j & 63) === 0) relK = Math.exp(-1 / ((0.05 + 0.45 * Math.min(1, avgRed / 0.25)) * sr));
+        if (apply) { L[j] *= gf; R[j] *= gf; }
+        const b = (j / D) | 0;
+        if (gf < blockMin[b]) blockMin[b] = gf;
+        if (gf < minG) minG = gf;
+        if (gf < 0.995) nLim++;
+      }
+      push(j + W);
+    }
+    const curve = new Float32Array(nb);
+    for (let k = 0; k < nb; k++) {
+      const a = k > 0 ? blockMin[k - 1] : 1, b = blockMin[k];
+      curve[k] = a < b ? a : b;
+    }
+    return { curve, D, minGain: minG, maxRedDb: minG < 1 ? -20 * Math.log10(minG) : 0, limitedPct: n ? 100 * nLim / n : 0 };
+  }
+
   return { clamp, FADER_MIN, FADER_MAX, UNITY_P, faderToGain, gainToFader, dbText, panText, panGains,
     mixStereo, toInt16, resampleLinear, encodeWav16, decodeWav, crc32, zipStore, unzip, safeName, fmtSize, mp3WorkerSource,
-    chirpTemplate, findTemplate, median, voiceFx, highpass, denoise, compressNormalize };
+    chirpTemplate, findTemplate, median, voiceFx, highpass, denoise, compressNormalize, limitMix, LIM_CEIL };
 })();
 </script>
 
@@ -690,7 +751,7 @@ const pause = () => new Promise(r => setTimeout(r, 0));
 
 const els = {
   tracks: $('tracks'), scroll: $('scroll'), time: $('time'), status: $('status'), meter: $('meter'),
-  monBtn: $('monBtn'), setBtn: $('setBtn'), projBtn: $('projBtn'), projLabel: $('projLabel'),
+  monBtn: $('monBtn'), limBtn: $('limBtn'), setBtn: $('setBtn'), projBtn: $('projBtn'), projLabel: $('projLabel'),
   mic: $('mic'), micMsg: $('micMsg'), micBtn: $('micBtn'),
   toast: $('toast'), addTrack: $('addTrack'),
   rew: $('btnRew'), stop: $('btnStop'), play: $('btnPlay'), rec: $('btnRec'),
@@ -1318,6 +1379,7 @@ function drawMeter(now) {
 
 /* ---------- Transport ---------- */
 function clearSources() {
+  try { master.gain.cancelScheduledValues(0); master.gain.setValueAtTime(1, ctx.currentTime); } catch (_) {}
   for (const s of S.sources) { try { s.stop(); } catch (_) {} try { s.disconnect(); } catch (_) {} }
   S.sources = [];
   for (const o of S.beeps) { try { o.stop(); } catch (_) {} try { o.disconnect(); } catch (_) {} }
@@ -1332,6 +1394,44 @@ function beep(t, freq) {
   o.connect(g); g.connect(master);
   o.start(t); o.stop(t + 0.12);
   S.beeps.push(o);
+}
+
+/* Limiter: Analyse des Mix und Automationskurve für die Wiedergabe */
+const dataIds = new WeakMap();
+let dataIdN = 0, limCache = { key: '', res: null };
+function dataId(d) { let v = dataIds.get(d); if (!v) { v = ++dataIdN; dataIds.set(d, v); } return v; }
+function limiterKey() {
+  return ctx.sampleRate + '|' + S.tracks.filter(t => t.data.length && audible(t))
+    .map(t => dataId(t.data) + ':' + t.vol + ':' + t.pan).join('|');
+}
+async function prepareLimiter() {
+  if (!S.project || !S.project.limiter) return null;
+  const items = S.tracks.filter(t => t.data.length && audible(t)).map(t => ({ data: t.data, gain: t.vol, pan: t.pan }));
+  const len = maxLen();
+  if (!items.length || !len) return null;
+  const key = limiterKey();
+  if (limCache.key === key) return limCache.res;
+  S.fxBusy = true; S.fxPct = 0;
+  try {
+    await new Promise(r => setTimeout(r, 30));
+    const mix = OD.mixStereo(items, len, 0);
+    const res = OD.limitMix(mix.L, mix.R, ctx.sampleRate, OD.LIM_CEIL, { apply: false });
+    limCache = { key, res };
+    if (res.maxRedDb > 0.1) toast('Limiter: senkt Spitzen um bis zu ' + res.maxRedDb.toFixed(1).replace('.', ',') + ' dB ab.');
+    return res;
+  } finally { S.fxBusy = false; }
+}
+function scheduleLimiter(lc) {
+  const sr = ctx.sampleRate, k0 = Math.floor(S.p0 * sr / lc.D);
+  const vals = lc.curve.subarray(k0);
+  if (vals.length < 2) return;
+  const off = (S.p0 * sr - k0 * lc.D) / sr;
+  try {
+    master.gain.setValueCurveAtTime(vals, Math.max(ctx.currentTime, S.T - off), (vals.length - 1) * lc.D / sr);
+  } catch (_) {}
+}
+function syncLim() {
+  els.limBtn.setAttribute('aria-pressed', String(!!(S.project && S.project.limiter)));
 }
 
 let wakeLock = null;
@@ -1361,6 +1461,8 @@ function startTransport(rec) {
     S.sources.push(src);
   }
   applyGains();
+  if (!rec && S.limCurve) scheduleLimiter(S.limCurve);
+  S.limCurve = null;
   if (rec) {
     S.rec = { track: target, startFrame: Math.round(T * sr), chunks: [], total: 0, peaks: [], acc: 0, accN: 0, done: false };
     startRecBackup(S.rec);
@@ -1564,6 +1666,8 @@ async function onPlay() {
   try {
     await ctx.resume();
     if (!maxEnd()) { toast('Noch keine Aufnahme vorhanden.'); return; }
+    S.limCurve = null;
+    try { S.limCurve = await prepareLimiter(); } catch (_) { S.limCurve = null; }
     startTransport(false);
   } finally { S.busy = false; }
 }
@@ -1648,7 +1752,22 @@ function prepareMix() {
   const items = S.tracks.filter(t => t.data.length && audible(t)).map(t => ({ data: t.data, gain: t.vol, pan: t.pan }));
   const len = maxLen();
   if (!items.length || !len) return null;
+  if (S.project && S.project.limiter) {
+    const mix = OD.mixStereo(items, len, 0);
+    mix.lim = OD.limitMix(mix.L, mix.R, ctx.sampleRate, OD.LIM_CEIL);
+    mix.scaled = false;
+    return mix;
+  }
   return OD.mixStereo(items, len, 0.98);
+}
+function mixNote(mix) {
+  if (mix.scaled) return 'Der Mix war zu laut und wurde etwas leiser gemacht.';
+  if (mix.lim) {
+    return mix.lim.maxRedDb > 0.05
+      ? 'Limiter: Spitzen wurden um bis zu ' + mix.lim.maxRedDb.toFixed(1).replace('.', ',') + ' dB abgesenkt.'
+      : 'Limiter: nicht nötig, der Mix blieb unter der Grenze.';
+  }
+  return '';
 }
 
 async function exportMixWav() {
@@ -1662,7 +1781,7 @@ async function exportMixWav() {
     if (tok !== X.token) return;
     const buf = OD.encodeWav16([mix.L, mix.R], ctx.sampleRate);
     finishExport(new Blob([buf], { type: 'audio/wav' }), OD.safeName(S.project.name) + '.wav', 'audio/wav',
-      mix.scaled ? 'Der Mix war zu laut und wurde etwas leiser gemacht.' : '');
+      mixNote(mix));
   } catch (e) { failExport(e); }
 }
 function prepareHasAudio() { return S.tracks.some(t => t.data.length && audible(t)); }
@@ -1704,7 +1823,7 @@ async function exportMixMp3() {
       else if (m.done) {
         cancelExport();
         finishExport(new Blob(m.parts, { type: 'audio/mpeg' }), OD.safeName(S.project.name) + '.mp3', 'audio/mpeg',
-          mix.scaled ? 'Der Mix war zu laut und wurde etwas leiser gemacht.' : '');
+          mixNote(mix));
       }
     };
     worker.onerror = ev => { cancelExport(); failExport(new Error(ev.message || 'Der MP3-Encoder konnte nicht starten.')); };
@@ -1768,6 +1887,7 @@ async function openProjectInner(rec) {
   S.armedId = S.tracks[0].id;
   S.tracks.forEach(refresh);
   els.projLabel.textContent = rec.name;
+  syncLim();
   S.settings.lastProject = rec.id;
   saveSettings();
   recalcView();
@@ -1839,7 +1959,7 @@ async function renderProjects() {
 /* Projektordner bauen: project.json plus eine WAV-Datei je Spur */
 async function buildProjectFiles(tok) {
   const sr = ctx.sampleRate, files = [];
-  const meta = { app: 'Overdub', version: 2, name: S.project.name, sampleRate: sr, exported: new Date().toISOString(), tracks: [] };
+  const meta = { app: 'Overdub', version: 2, name: S.project.name, limiter: !!S.project.limiter, sampleRate: sr, exported: new Date().toISOString(), tracks: [] };
   let i = 0;
   for (const t of S.tracks) {
     i++;
@@ -1910,6 +2030,7 @@ async function importEntries(entries) {
   let name = String(meta.name || 'Importiertes Projekt').slice(0, 40);
   if (existing.some(p => p.name === name)) name += ' (geladen)';
   const rec = newProjectRecord(name);
+  rec.limiter = !!meta.limiter;
   const list = meta.tracks.slice(0, MAX_TRACKS);
   let maxSamples = 0;
   for (let i = 0; i < list.length; i++) {
@@ -2101,6 +2222,19 @@ els.monBtn.addEventListener('click', async () => {
   S.monitor = !S.monitor;
   applyMonitor();
   if (S.monitor) toast('Mithören ist an. Bitte nur mit Kopfhörern.');
+});
+
+/* Limiter */
+els.limBtn.addEventListener('click', () => {
+  if (!S.project) return;
+  S.project.limiter = !S.project.limiter;
+  limCache = { key: '', res: null };
+  syncLim();
+  writeProject();
+  if (!S.project.limiter) {
+    try { master.gain.cancelScheduledValues(0); master.gain.setValueAtTime(1, ctx.currentTime); } catch (_) {}
+    toast('Limiter aus.');
+  } else toast(S.mode === 'playing' ? 'Limiter an. Er wirkt ab dem nächsten Abspielen.' : 'Limiter an: schützt den ganzen Mix vor Übersteuern, bei Wiedergabe und Export.');
 });
 
 /* Einstellungen */
